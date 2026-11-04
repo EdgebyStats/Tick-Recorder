@@ -1,0 +1,8 @@
+**/__pycache__/
+/*.pyc
+
+tick_recorder/Extras/
+tick_recorder/main.py.bak
+
+config.json
+/ticks
