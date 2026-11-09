@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+import time
+import logging
 
 from tick_recorder.storage.constants import BUFFER_MAX_BYTES
-from tick_recorder.utils.time_utils import utc_day, trading_day
+from tick_recorder.utils.time_utils import utc_day_window, trading_day_window
 
 
 class BufferedDailyFile:
@@ -23,9 +24,22 @@ class BufferedDailyFile:
     Thread safety: must only be called from the reactor thread. The owning
     Storage class enforces this via assertion.
 
-    Day rollover can use either UTC (default) or a firm timezone. 
+    Day rollover can use either UTC (default) or a firm timezone.
     - Raw frames: always UTC (firm-agnostic -- bytes are bytes)
     - Spots/events: firm timezone (so files match firm trading days)
+
+    Per-tick cost: the day string used to be recomputed on every write()
+    (datetime + strftime per tick, ~6.5M times/day). Now the day *window*
+    (start/end ns + day string) is cached and write() only does two integer
+    compares; the datetime work happens on rollover ticks only (~once/day,
+    plus clock jumps). See _roll().
+
+    NOTE: day classification is exact integer arithmetic. The
+    cached window bounds are exact integer midnights (see time_utils
+    *_day_window), and the hot path compares the raw int ns against them
+    with `self._win_start <= ns < self._win_end`. Floating point / datetime
+    math never runs on the per-tick path and never decides which file a
+    tick lands in — only which filename string the day gets.
     """
 
     def __init__(self, folder: str, suffix: str, binary: bool,
@@ -37,24 +51,49 @@ class BufferedDailyFile:
         self.header = header
         self.firm_timezone = firm_timezone  # None = UTC (raw frames)
         self.day: str | None = None
+        self._flush_max: float = 0.0
         self.fh = None
         self._buffer = bytearray()
         self._buffer_day: str | None = None
+        # Cached day window: _win_start <= ns < _win_end belong to self.day.
+        # None = not yet computed (first write, or previous rollover failed).
+        self._win_start: int | None = None      # Daily window start
+        self._win_end: int | None = None        # Daily window end
+
+    def _compute_window(self, ns: int) -> tuple[int, int, str]:
+        """(start_ns, end_ns, day string) for this timestamp, UTC or firm time."""
+        if self.firm_timezone is None:
+            return utc_day_window(ns)
+        return trading_day_window(ns, self.firm_timezone)
 
     def _compute_day(self, ns: int) -> str:
-        """Return the day string for this timestamp, in UTC or firm time. """
-        if self.firm_timezone is None:
-            return utc_day(ns)
-        return trading_day(ns, self.firm_timezone)
+        """Return the day string for this timestamp (kept for compatibility)."""
+        return self._compute_window(ns)[2]
+
+    def _roll(self, ns: int) -> None:
+        """Rollover path: recompute the day window for ns.
+
+        Called only when ns falls outside the cached window (rollover, first
+        write, or a clock jump) — never on the hot path. If the day changed,
+        open its file; on open failure, leave the window uncached so the next
+        write retries (same retry semantics as before).
+        """
+        start, end, day = self._compute_window(ns)
+        if day != self.day:
+            self._open_for_day(day)
+            if self.day != day:
+                return  # open failed; window stays uncached -> retry next write
+        self._win_start, self._win_end = start, end
 
     # ---- write (cheap, never blocks on disk) -------------------------------
     def write(self, data: bytes, ns: int) -> None:
-        day = self._compute_day(ns)
+        # Hot path: two int compares. Full day recompute only on rollover.
+        if self._win_start is None or not (self._win_start <= ns < self._win_end):
+            self._roll(ns)
+        day = self.day
         # Day changed: flush yesterday's buffer before opening new file.
         if self._buffer_day is not None and day != self._buffer_day:
             self._flush_to_disk()
-        if day != self.day:
-            self._open_for_day(day)
         self._buffer.extend(data)
         # Safety valve: if buffer is huge, flush now.
         if len(self._buffer) >= BUFFER_MAX_BYTES:
@@ -82,7 +121,6 @@ class BufferedDailyFile:
         except OSError as e:
             # Leave self.day at old value, self.fh as None.
             # Next write will retry the open.
-            import logging
             logging.getLogger("tick.storage").error(
                 "failed to open %s: %s", path, e
             )
@@ -96,9 +134,17 @@ class BufferedDailyFile:
     def _flush_to_disk(self) -> None:
         if not self._buffer or self.fh is None:
             return
+        n = len(self._buffer)
+        t0 = time.perf_counter()
         self.fh.write(bytes(self._buffer))
         self.fh.flush()
+        dt_ms = (time.perf_counter() - t0) * 1e3
         self._buffer.clear()
+        self._flush_max = max(getattr(self, "_flush_max", 0.0), dt_ms)
+        if dt_ms > 2.0:
+            logging.getLogger("tick.storage").warning(
+                "slow flush: %.2f ms for %d bytes", dt_ms,n
+            )
 
     # ---- close --------------------------------------------------------------
     def close(self) -> None:
