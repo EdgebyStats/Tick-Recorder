@@ -93,17 +93,17 @@ class BufferedDailyFile:
         day = self.day
         # Day changed: flush yesterday's buffer before opening new file.
         if self._buffer_day is not None and day != self._buffer_day:
-            self._flush_to_disk()
+            self._flush_to_page_cache()
         self._buffer.extend(data)
         # Safety valve: if buffer is huge, flush now.
         if len(self._buffer) >= BUFFER_MAX_BYTES:
-            self._flush_to_disk()
+            self._flush_to_page_cache()
         self._buffer_day = day
 
     def _open_for_day(self, day: str) -> None:
         # Close any existing handle first.
         if self.fh is not None:
-            self._flush_to_disk()
+            self._flush_to_page_cache()
             self.fh.close()
             self.fh = None
         os.makedirs(self.folder, exist_ok=True)
@@ -129,26 +129,32 @@ class BufferedDailyFile:
     def maybe_flush(self) -> None:
         """Cheap to call frequently — does nothing if buffer is empty."""
         if self._buffer:
-            self._flush_to_disk()
+            self._flush_to_page_cache()
 
-    def _flush_to_disk(self) -> None:
+    def _flush_to_page_cache(self) -> None:
+        """Hand buffer to the kernel page cache.
+        Not durable: data sits as dirty pages until kernel writeback (30s approx)
+        or close()'s fsync. Crash before that loses this buffer
+        """
         if not self._buffer or self.fh is None:
             return
         n = len(self._buffer)
-        t0 = time.perf_counter()
+        t0w = time.perf_counter()
+        t0c = time.process_time()
         self.fh.write(bytes(self._buffer))
         self.fh.flush()
-        dt_ms = (time.perf_counter() - t0) * 1e3
+        wall_ms = (time.perf_counter() - t0w) * 1e3
+        cpu_ms = (time.process_time() - t0c) * 1e3
         self._buffer.clear()
-        self._flush_max = max(getattr(self, "_flush_max", 0.0), dt_ms)
-        if dt_ms > 2.0:
+        if wall_ms > 2.0:
+            kind = "CPU/GC" if cpu_ms > wall_ms * 0.5 else "I/O wait"
             logging.getLogger("tick.storage").warning(
-                "slow flush: %.2f ms for %d bytes", dt_ms,n
+                "slow flush: %.2f ms wall (%.2f ms cpu) for %d bytes [%s]", wall_ms, cpu_ms, n, kind
             )
 
     # ---- close --------------------------------------------------------------
     def close(self) -> None:
-        self._flush_to_disk()
+        self._flush_to_page_cache()
         if self.fh is not None:
             self.fh.flush()
             os.fsync(self.fh.fileno())

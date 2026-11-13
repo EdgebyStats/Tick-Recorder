@@ -1,4 +1,4 @@
-"""Storage — single I/O gateway. No other class touches disk directly."""
+"""Storage — single I/O gateway. No other class touches kernel page cache directly."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ CRITICAL_EVENTS: frozenset = frozenset({
 
 
 class Storage:
-    """Single I/O gateway. No other class touches disk directly."""
+    """Single I/O gateway. No other class touches kernel page cache directly."""
 
     def __init__(self, data_dir: str, base_path: str, accounts: list):
         self.data_dir = data_dir
@@ -171,7 +171,7 @@ class Storage:
     # Flush + close
     # ------------------------------------------------------------------
     def flush(self) -> None:
-        """Called by Recorder's 1 Hz LoopingCall — drains all buffers to disk."""
+        """Called by Recorder's 1 Hz LoopingCall — drains all buffers to kernel page cache."""
         self._assert_reactor_thread()
         if self.closed:
             return

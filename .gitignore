@@ -5,4 +5,6 @@ tick_recorder/Extras/
 tick_recorder/main.py.bak
 
 config.json
+/tick_recorder/utils/time_utilsOld.py
+/tick_recorder/storage/buffered_fileOld.py
 /ticks
